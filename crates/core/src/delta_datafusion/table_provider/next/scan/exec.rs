@@ -337,10 +337,7 @@ impl ExecutionPlan for DeltaScanExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        // TODO(roeap): this will likely not do much for column mapping enabled tables
-        // since the default methods determines this based on existence of columns in child
-        // schemas. In the case of column mapping all columns will have a different name.
-        FilterDescription::from_children(parent_filters, &self.children())
+        super::filter::gather_filters_for_pushdown(parent_filters, &self.children())
     }
 }
 

@@ -53,7 +53,8 @@ use url::Url;
 
 pub use self::exec::DeltaScanExec;
 use self::exec_meta::DeltaScanMetaExec;
-pub(crate) use self::plan::{KernelScanPlan, supports_filters_pushdown};
+pub(crate) use self::filter::supports_filters_pushdown;
+pub(crate) use self::plan::KernelScanPlan;
 use self::replay::{ScanFileContext, ScanFileStream};
 use super::FileSelection;
 use crate::{
@@ -68,6 +69,7 @@ use crate::{
 
 mod exec;
 mod exec_meta;
+mod filter;
 mod plan;
 mod replay;
 
