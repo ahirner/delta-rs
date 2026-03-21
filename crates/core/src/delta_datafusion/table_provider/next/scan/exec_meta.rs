@@ -291,7 +291,7 @@ impl ExecutionPlan for DeltaScanMetaExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        super::filter::gather_filters_for_pushdown(parent_filters, &self.children())
+        super::filter::gather_filters_for_pushdown(self.schema(), parent_filters, &self.children())
     }
 }
 

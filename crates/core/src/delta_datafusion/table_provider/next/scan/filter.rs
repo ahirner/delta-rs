@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::error::Result;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter_pushdown::FilterDescription;
-use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
+use datafusion_physical_expr_adapter::{
+    DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory,
+};
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{HashMap, plan_err};
@@ -24,13 +26,29 @@ use crate::delta_datafusion::engine::{
 use crate::delta_datafusion::table_provider::next::FILE_ID_COLUMN_DEFAULT;
 
 pub(crate) fn gather_filters_for_pushdown(
+    logical_schema: SchemaRef,
     parent_filters: Vec<Arc<dyn PhysicalExpr>>,
     children: &[&Arc<dyn ExecutionPlan>],
 ) -> Result<FilterDescription> {
-    // TODO(roeap): this will likely not do much for column mapping enabled tables
-    // since the default methods determines this based on existence of columns in child
-    // schemas. In the case of column mapping all columns will have a different name.
-    FilterDescription::from_children(parent_filters, children)
+    if children.is_empty() {
+        return FilterDescription::from_children(parent_filters, children);
+    }
+
+    let factory = DefaultPhysicalExprAdapterFactory {};
+    let child_schema = children[0].schema();
+    let adapter = factory.create(logical_schema, child_schema);
+
+    let mut adapted_filters = Vec::new();
+    for filter in parent_filters {
+        if let Ok(rewritten) = adapter.rewrite(filter.clone()) {
+            adapted_filters.push(rewritten);
+        } else {
+            // Keep the original filter if rewrite fails, it will just not be pushed down
+            adapted_filters.push(filter);
+        }
+    }
+
+    FilterDescription::from_children(adapted_filters, children)
 }
 
 pub(crate) fn supports_filters_pushdown(
@@ -73,16 +91,12 @@ pub(crate) fn process_filters(
         .map(|f| process_predicate(f, config, file_id_field, parquet_pushdown_enabled))
         .map(|p| (p.parquet_predicate, p.kernel_predicate))
         .unzip();
-    let parquet = if config.is_feature_enabled(&TableFeature::ColumnMapping) {
-        conjunction(
-            parquet
-                .iter()
-                .flatten()
-                .filter_map(|ex| rewrite_expression((*ex).clone(), config).ok()),
-        )
-    } else {
-        conjunction(parquet.iter().flatten().map(|ex| (*ex).clone()))
-    };
+    let parquet = conjunction(
+        parquet
+            .iter()
+            .flatten()
+            .filter_map(|ex| rewrite_expression((*ex).clone(), config).ok()),
+    );
     let kernel = (!kernel.is_empty()).then(|| Predicate::and_from(kernel.into_iter().flatten()));
     Ok((kernel.map(Arc::new), parquet))
 }
@@ -164,7 +178,7 @@ fn process_predicate<'a>(
     }
 }
 
-fn rewrite_expression(expr: Expr, config: &TableConfiguration) -> Result<Expr> {
+pub(crate) fn rewrite_expression(expr: Expr, config: &TableConfiguration) -> Result<Expr> {
     let logical_fields = config.schema().leaves(None);
     let (logical_names, _) = logical_fields.as_ref();
     let physical_schema = config
