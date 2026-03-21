@@ -404,6 +404,10 @@ impl TableProvider for DeltaScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        eprintln!(
+            "[DEBUG] DeltaScan::scan called with projection: {:?}",
+            projection
+        );
         let engine = DataFusionEngine::new_from_session(session);
 
         // Filter out file_id column from projection if present
@@ -414,8 +418,8 @@ impl TableProvider for DeltaScan {
             .map(|_| self.scan_schema.fields().len());
         let kernel_projection = projection.map(|proj| {
             proj.iter()
-                .filter(|&&idx| Some(idx) != file_id_idx)
                 .copied()
+                .filter(|&idx| Some(idx) != file_id_idx)
                 .collect::<Vec<_>>()
         });
 
@@ -432,6 +436,7 @@ impl TableProvider for DeltaScan {
         scan::execution_plan(
             &self.config,
             session,
+            projection,
             scan_plan,
             stream,
             engine,
@@ -492,6 +497,9 @@ impl TableProvider for DeltaScan {
         ))
     }
 }
+
+#[cfg(test)]
+mod test_bug;
 
 #[cfg(test)]
 mod tests {

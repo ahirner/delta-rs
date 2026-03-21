@@ -144,8 +144,13 @@ impl DeltaScanExec {
         retain_file_ids: bool,
         metrics: ExecutionPlanMetricsSet,
     ) -> Self {
+        let output_schema = if retain_file_ids {
+            scan_plan.output_schema.clone()
+        } else {
+            scan_plan.result_schema.clone()
+        };
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(scan_plan.output_schema.clone()),
+            EquivalenceProperties::new(output_schema),
             input.properties().partitioning.clone(),
             input.properties().emission_type,
             input.properties().boundedness,
@@ -337,10 +342,11 @@ impl ExecutionPlan for DeltaScanExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        // TODO(roeap): this will likely not do much for column mapping enabled tables
-        // since the default methods determines this based on existence of columns in child
-        // schemas. In the case of column mapping all columns will have a different name.
-        FilterDescription::from_children(parent_filters, &self.children())
+        super::filter::gather_filters_for_pushdown(
+            self.properties().eq_properties.schema().clone(),
+            parent_filters,
+            &self.children(),
+        )
     }
 }
 
@@ -506,7 +512,11 @@ impl Stream for DeltaScanStream {
 
 impl RecordBatchStream for DeltaScanStream {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.scan_plan.output_schema)
+        if self.return_file_ids {
+            Arc::clone(&self.scan_plan.output_schema)
+        } else {
+            Arc::clone(&self.scan_plan.result_schema)
+        }
     }
 }
 
