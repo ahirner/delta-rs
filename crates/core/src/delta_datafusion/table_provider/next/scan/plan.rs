@@ -140,7 +140,9 @@ impl KernelScanPlan {
         }
 
         // With the updated projection, build the scan
-        let kernel_scan_schema = Arc::new((&table_schema.project(&projection)?).try_into_kernel()?);
+        let schema_for_kernel: Schema = table_config.schema().as_ref().try_into_arrow()?;
+        let kernel_scan_schema =
+            Arc::new((&schema_for_kernel.project(&projection)?).try_into_kernel()?);
         let scan = Arc::new(scan_builder.with_schema(kernel_scan_schema).build()?);
 
         // We may have read columns in the scan that are purely for predicate processing.
@@ -231,6 +233,9 @@ impl DeltaScanConfig {
     /// such as dictionary encoding of partition columns or
     /// view types.
     pub(crate) fn table_schema(&self, table_config: &TableConfiguration) -> Result<SchemaRef> {
+        if let Some(schema) = &self.schema {
+            return Ok(schema.clone());
+        }
         let table_schema: Schema = table_config.schema().as_ref().try_into_arrow()?;
         self.physical_arrow_schema(table_config, &table_schema)
     }
@@ -512,6 +517,7 @@ fn rewrite_expression(expr: Expr, config: &TableConfiguration) -> Result<Expr> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::logical_expr::TableProviderFilterPushDown;
     use datafusion::{
         assert_batches_sorted_eq,
         physical_plan::collect,
@@ -519,7 +525,9 @@ mod tests {
         scalar::ScalarValue,
     };
 
+    use super::super::filter::{rewrite_expression, supports_filters_pushdown};
     use crate::{
+        delta_datafusion::FILE_ID_COLUMN_DEFAULT,
         delta_datafusion::create_session,
         test_utils::{TestResult, open_fs_path},
     };
