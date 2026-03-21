@@ -1,106 +1,88 @@
-use crate::DeltaTable;
 use crate::delta_datafusion::DeltaScanConfig;
-use crate::kernel::{DataType, PrimitiveType, StructField, StructType};
-use arrow::array::{Int64Array, TimestampMillisecondArray};
+use crate::delta_datafusion::session::create_session;
+use crate::test_utils::{TestResult, open_fs_path};
+use arrow::array::{BinaryArray, Date32Array, TimestampMillisecondArray};
 use arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
 use arrow::record_batch::RecordBatch;
+use arrow_array::builder::{BinaryDictionaryBuilder, StringDictionaryBuilder};
+use arrow_array::types::UInt16Type;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-async fn get_table_and_provider() -> (DeltaTable, Arc<crate::delta_datafusion::DeltaScanNext>) {
-    let physical_schema = StructType::try_new(vec![StructField::new(
-        "id".to_string(),
-        DataType::Primitive(PrimitiveType::Long),
-        true,
-    )])
-    .unwrap();
+async fn get_table_and_provider() -> TestResult<(
+    crate::DeltaTable,
+    Arc<crate::delta_datafusion::table_provider::next::DeltaScan>,
+)> {
+    let mut table = open_fs_path("../../dat/v0.0.3/reader_tests/generated/multi_partitioned/delta");
+    table.load().await.unwrap();
 
-    let table = DeltaTable::new_in_memory()
-        .create()
-        .with_columns(physical_schema.fields().cloned())
-        .await
-        .unwrap();
-
-    let batch = RecordBatch::try_new(
-        Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            ArrowDataType::Int64,
+    let logical_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "letter",
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt16),
+                Box::new(ArrowDataType::Utf8),
+            ),
             true,
-        )])),
-        vec![Arc::new(Int64Array::from(vec![1]))],
-    )
-    .unwrap();
-
-    let table = crate::operations::write::WriteBuilder::new(
-        table.log_store(),
-        table.state.clone().map(|s| s.snapshot().clone()),
-    )
-    .with_input_batches(vec![batch])
-    .await
-    .unwrap();
-
-    let logical_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "id",
-        ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
-        true,
-    )]));
+        ),
+        ArrowField::new("date", ArrowDataType::Date32, true),
+        ArrowField::new(
+            "data",
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt16),
+                Box::new(ArrowDataType::Binary),
+            ),
+            true,
+        ),
+        ArrowField::new(
+            "number",
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+    ]));
     let config = DeltaScanConfig::default().with_schema(logical_schema.clone());
 
-    let provider = crate::delta_datafusion::DeltaScanNext::new(
-        table.state.as_ref().unwrap().snapshot().clone(),
+    let provider = crate::delta_datafusion::table_provider::next::DeltaScan::new(
+        table.snapshot().unwrap().snapshot().clone(),
         config,
     )
     .unwrap()
     .with_log_store(table.log_store());
 
-    (table, Arc::new(provider))
-}
-
-fn register_table(
-    ctx: &SessionContext,
-    name: &str,
-    table: &DeltaTable,
-    provider: Arc<crate::delta_datafusion::DeltaScanNext>,
-) {
-    ctx.runtime_env().register_object_store(
-        table.log_store().root_url(),
-        table.log_store().object_store(None),
-    );
-    ctx.register_table(name, provider).unwrap();
+    Ok((table, Arc::new(provider)))
 }
 
 #[tokio::test]
-async fn test_delta_scan_config_schema_override_scan() {
-    let (table, provider) = get_table_and_provider().await;
+async fn test_delta_scan_config_schema_override_scan() -> TestResult {
+    let (_table, provider) = get_table_and_provider().await?;
 
-    let ctx = SessionContext::new();
-    register_table(&ctx, "test_table", &table, provider);
+    let ctx = create_session().into_inner();
+    ctx.register_table("test_table", provider).unwrap();
 
-    let df = ctx.sql("SELECT id FROM test_table").await.unwrap();
-    let res = df.collect().await;
-    assert!(res.is_ok(), "Expected OK, but got: {:?}", res);
+    let df = ctx.sql("SELECT number FROM test_table").await.unwrap();
+    let batches = df.collect().await.unwrap();
 
-    let batches = res.unwrap();
     assert_eq!(
         batches[0].schema().fields()[0].data_type(),
         &ArrowDataType::Timestamp(TimeUnit::Millisecond, None)
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_delta_scan_config_schema_override_filter() {
-    let (table, provider) = get_table_and_provider().await;
+async fn test_delta_scan_config_schema_override_filter() -> TestResult {
+    let (_table, provider) = get_table_and_provider().await?;
 
-    let ctx = SessionContext::new();
-    register_table(&ctx, "test_table", &table, provider);
+    let ctx = create_session().into_inner();
+    ctx.register_table("test_table", provider).unwrap();
 
     let df = ctx
-        .sql("SELECT id FROM test_table WHERE id < '2020-01-01T00:00:00Z'")
+        .sql("SELECT number FROM test_table WHERE number < '2020-01-01T00:00:00Z'")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
@@ -110,21 +92,33 @@ async fn test_delta_scan_config_schema_override_filter() {
         &ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
         "Filter output schema does not match logical schema"
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_delta_scan_config_schema_override_insert() {
-    let (table, provider) = get_table_and_provider().await;
+async fn test_delta_scan_config_schema_override_insert() -> TestResult {
+    let (_table, provider) = get_table_and_provider().await?;
 
-    let ctx = SessionContext::new();
-    register_table(&ctx, "test_table", &table, provider.clone());
+    let ctx = create_session().into_inner();
+    ctx.register_table("test_table", provider.clone()).unwrap();
     let state = ctx.state();
 
     let logical_schema = provider.schema();
 
+    let mut dict_builder = StringDictionaryBuilder::<UInt16Type>::new();
+    dict_builder.append("a").unwrap();
+    let mut bin_builder = BinaryDictionaryBuilder::<UInt16Type>::new();
+    bin_builder.append(b"hello").unwrap();
+
     let batch = RecordBatch::try_new(
         logical_schema.clone(),
-        vec![Arc::new(TimestampMillisecondArray::from(vec![2000]))],
+        vec![
+            Arc::new(dict_builder.finish()),
+            Arc::new(Date32Array::from(vec![0])),
+            Arc::new(bin_builder.finish()),
+            Arc::new(TimestampMillisecondArray::from(vec![2000])),
+        ],
     )
     .unwrap();
 
@@ -135,38 +129,61 @@ async fn test_delta_scan_config_schema_override_insert() {
         .insert_into(&state, input, InsertOp::Append)
         .await
         .unwrap();
-    let res = datafusion::physical_plan::collect_partitioned(write_plan, ctx.task_ctx()).await;
-    assert!(res.is_ok(), "Expected OK, but got: {:?}", res);
+
+    let _ = datafusion::physical_plan::collect_partitioned(write_plan, ctx.task_ctx())
+        .await
+        .unwrap();
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_delta_scan_config_file_column_projection() {
-    let (table, _) = get_table_and_provider().await;
+async fn test_delta_scan_config_file_column_projection() -> TestResult {
+    let (mut table, _) = get_table_and_provider().await?;
+    table.load().await.unwrap();
 
-    let logical_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "id",
-        ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
-        true,
-    )]));
+    let logical_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "letter",
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt16),
+                Box::new(ArrowDataType::Utf8),
+            ),
+            true,
+        ),
+        ArrowField::new("date", ArrowDataType::Date32, true),
+        ArrowField::new(
+            "data",
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt16),
+                Box::new(ArrowDataType::Binary),
+            ),
+            true,
+        ),
+        ArrowField::new(
+            "number",
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+    ]));
     let config = DeltaScanConfig::default()
         .with_schema(logical_schema.clone())
         .with_file_column_name("_file");
 
-    let provider = crate::delta_datafusion::DeltaScanNext::new(
-        table.state.as_ref().unwrap().snapshot().clone(),
+    let provider = crate::delta_datafusion::table_provider::next::DeltaScan::new(
+        table.snapshot().unwrap().snapshot().clone(),
         config,
     )
     .unwrap()
     .with_log_store(table.log_store());
 
-    let ctx = SessionContext::new();
-    register_table(&ctx, "test_table", &table, Arc::new(provider));
+    let ctx = create_session().into_inner();
+    ctx.register_table("test_table", Arc::new(provider))
+        .unwrap();
 
-    let df = ctx.sql("SELECT id FROM test_table").await.unwrap();
-    let res = df.collect().await;
-    assert!(res.is_ok(), "Expected OK, but got: {:?}", res);
+    let df = ctx.sql("SELECT number FROM test_table").await.unwrap();
+    let batches = df.collect().await.unwrap();
 
-    let batches = res.unwrap();
     assert_eq!(
         batches[0].schema().fields().len(),
         1,
@@ -178,4 +195,6 @@ async fn test_delta_scan_config_file_column_projection() {
             .map(|f| f.name())
             .collect::<Vec<_>>()
     );
+
+    Ok(())
 }
