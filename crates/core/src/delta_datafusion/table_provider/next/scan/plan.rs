@@ -25,11 +25,12 @@ use datafusion::logical_expr::utils::conjunction;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::file_scan_config::wrap_partition_type_in_dict;
-use delta_kernel::engine::arrow_conversion::{TryIntoArrow as _, TryIntoKernel as _};
+use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel as _};
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::table_configuration::TableConfiguration;
+use delta_kernel::table_configuration::{self, TableConfiguration};
 use delta_kernel::table_features::TableFeature;
-use delta_kernel::{Expression, Predicate, PredicateRef};
+use delta_kernel::{AsAny, Expression, Predicate, PredicateRef};
+use indexmap::Equivalent;
 use itertools::Itertools;
 
 use crate::delta_datafusion::DeltaScanConfig;
@@ -364,12 +365,21 @@ pub(crate) fn supports_filters_pushdown(
         && !config.is_feature_enabled(&TableFeature::DeletionVectors);
     filter
         .iter()
-        .map(|f| process_predicate(f, config, file_id_field, parquet_pushdown_enabled).pushdown)
+        .map(|f| {
+            process_predicate(
+                f,
+                config,
+                scan_config.schema.as_deref(),
+                file_id_field,
+                parquet_pushdown_enabled,
+            )
+            .pushdown
+        })
         .collect()
 }
 
 /// Process a list of filter expressions and determine which
-/// predicates can be pushed down to the parquet scan and which
+/// predicates can be pushed down to the physical parquet scan per file group and which
 /// can be handled at the kernel scan level.
 ///
 /// The returned kernel predicate can be used when crating
@@ -392,7 +402,15 @@ fn process_filters(
         && !config.is_feature_enabled(&TableFeature::DeletionVectors);
     let (parquet, kernel): (Vec<_>, Vec<_>) = filters
         .iter()
-        .map(|f| process_predicate(f, config, file_id_field, parquet_pushdown_enabled))
+        .map(|f| {
+            process_predicate(
+                f,
+                config,
+                scan_config.schema.as_deref(),
+                file_id_field,
+                parquet_pushdown_enabled,
+            )
+        })
         .map(|p| (p.parquet_predicate, p.kernel_predicate))
         .unzip();
     let parquet = if config.is_feature_enabled(&TableFeature::ColumnMapping) {
@@ -419,14 +437,31 @@ struct ProcessedPredicate<'a> {
 fn process_predicate<'a>(
     expr: &'a Expr,
     config: &TableConfiguration,
+    config_schema: Option<&Schema>,
     file_id_column: &str,
     parquet_pushdown_enabled: bool,
 ) -> ProcessedPredicate<'a> {
-    let cols = config.metadata().partition_columns();
-    let only_partition_refs = expr.column_refs().iter().all(|c| cols.contains(&c.name));
-    let any_partition_refs =
-        only_partition_refs || expr.column_refs().iter().any(|c| cols.contains(&c.name));
-    let has_file_id = expr.column_refs().iter().any(|c| file_id_column == c.name);
+    let partition_cols = config.metadata().partition_columns();
+    let mut only_partition_refs = true;
+    let mut any_partition_refs = false;
+    let mut any_refs_to_configured = false;
+    let mut has_file_id = false;
+    for col in expr.column_refs() {
+        if partition_cols.contains(&col.name) {
+            any_partition_refs = true;
+        } else {
+            only_partition_refs = false;
+        }
+        if col.name == file_id_column {
+            has_file_id = true;
+        }
+        if config_schema
+            .map(|schema| schema.field_with_name(&col.name).is_ok())
+            .unwrap_or_default()
+        {
+            any_refs_to_configured = true;
+        }
+    }
 
     if has_file_id {
         // file-id filters cannot be evaluated in kernel and must not be pushed to parquet.
@@ -442,6 +477,7 @@ fn process_predicate<'a>(
     // into the parquet scan, if the table has materialized partition columns
     let _has_partition_data = config.is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
+    dbg!(any_refs_to_configured);
     // Try to convert the expression into a kernel predicate
     if let Ok(kernel_predicate) = to_delta_predicate(expr) {
         let (pushdown, parquet_predicate) = if only_partition_refs {
@@ -457,7 +493,8 @@ fn process_predicate<'a>(
         } else {
             // For non-partition predicates we can *attempt* Parquet pushdown, but it is not a
             // correctness boundary (it may be partially applied or skipped). Keep this Inexact so
-            // DataFusion retains a post-scan Filter.
+            // DataFusion retains a post-scan Filter which can still be pushed down dynamically
+            // during physical optimization.
             (
                 TableProviderFilterPushDown::Inexact,
                 parquet_pushdown_enabled.then_some(expr),
@@ -470,9 +507,15 @@ fn process_predicate<'a>(
         };
     }
 
+    if !any_refs_to_configured {
+        dbg!(expr);
+    }
     // If there are any partition column references, we cannot
-    // push down the predicate to parquet scan
-    if any_partition_refs {
+    // push down the predicate to parquet scan.
+    // Similarly, if the epression referenced a column from custom schema
+    // but is not supported as delta predicate, it's safe(st) to assume it can't
+    // be applied to the parquet table directly, e.g. without casts.
+    if any_partition_refs | any_refs_to_configured {
         return ProcessedPredicate {
             pushdown: TableProviderFilterPushDown::Unsupported,
             kernel_predicate: None,
