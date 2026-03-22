@@ -144,11 +144,13 @@ impl DeltaScanExec {
         retain_file_ids: bool,
         metrics: ExecutionPlanMetricsSet,
     ) -> Self {
+        /*
         let output_schema = if retain_file_ids {
             scan_plan.output_schema.clone()
         } else {
             scan_plan.result_schema.clone()
-        };
+        };*/
+        let output_schema = scan_plan.output_schema.clone();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             input.properties().partitioning.clone(),
@@ -346,6 +348,11 @@ impl ExecutionPlan for DeltaScanExec {
         // since the default methods determines this based on existence of columns in child
         // schemas. In the case of column mapping all columns will have a different name.
         FilterDescription::from_children(parent_filters, &self.children())
+        /*
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))*/
     }
 }
 

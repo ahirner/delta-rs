@@ -91,7 +91,7 @@ impl KernelScanPlan {
 
         // if some dedicated file skipping predicate is supplied,
         // we do not push the scan filters into the kernel scan.
-        let scan_predicate = if let Some(sp) = skipping_predicate {
+        let kernel_scan_predicate = if let Some(sp) = skipping_predicate {
             let (Some(pred), _) = process_filters(&sp, table_config, config)? else {
                 return exec_err!("Failed to convert file skipping perdicate to kernel.");
             };
@@ -102,7 +102,8 @@ impl KernelScanPlan {
 
         let scan_builder = snapshot
             .scan_builder()
-            .with_predicate(scan_predicate.clone());
+            //.with_schema(Arc::new(table_schema.clone().try_into_kernel().unwrap()))
+            .with_predicate(kernel_scan_predicate);
 
         let Some(projection) = projection else {
             let scan = Arc::new(scan_builder.build()?);
@@ -140,6 +141,7 @@ impl KernelScanPlan {
         }
 
         // With the updated projection, build the scan
+        //let kernel_scan_schema = Arc::new((&table_schema.project(&projection)?).try_into_kernel()?);
         let schema_for_kernel: Schema = table_config.schema().as_ref().try_into_arrow()?;
         let kernel_scan_schema =
             Arc::new((&schema_for_kernel.project(&projection)?).try_into_kernel()?);
@@ -234,10 +236,13 @@ impl DeltaScanConfig {
     /// view types.
     pub(crate) fn table_schema(&self, table_config: &TableConfiguration) -> Result<SchemaRef> {
         if let Some(schema) = &self.schema {
-            return Ok(schema.clone());
+            self.physical_arrow_schema(table_config, schema)
+        } else {
+            let table_schema: Schema = table_config.schema().as_ref().try_into_arrow()?;
+            self.physical_arrow_schema(table_config, &table_schema)
         }
-        let table_schema: Schema = table_config.schema().as_ref().try_into_arrow()?;
-        self.physical_arrow_schema(table_config, &table_schema)
+        //let table_schema: Schema = table_config.schema().as_ref().try_into_arrow()?;
+        //self.physical_arrow_schema(table_config, &table_schema)
     }
 
     fn physical_arrow_schema(
@@ -395,7 +400,8 @@ fn process_filters(
             parquet
                 .iter()
                 .flatten()
-                .filter_map(|ex| rewrite_expression((*ex).clone(), config).ok()),
+                //.filter_map(|ex| rewrite_expression((*ex).clone(), config).ok()),
+                .map(|ex| rewrite_expression((*ex).clone(), config).unwrap()),
         )
     } else {
         conjunction(parquet.iter().flatten().map(|ex| (*ex).clone()))
@@ -517,7 +523,6 @@ fn rewrite_expression(expr: Expr, config: &TableConfiguration) -> Result<Expr> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::logical_expr::TableProviderFilterPushDown;
     use datafusion::{
         assert_batches_sorted_eq,
         physical_plan::collect,
@@ -525,9 +530,7 @@ mod tests {
         scalar::ScalarValue,
     };
 
-    use super::super::filter::{rewrite_expression, supports_filters_pushdown};
     use crate::{
-        delta_datafusion::FILE_ID_COLUMN_DEFAULT,
         delta_datafusion::create_session,
         test_utils::{TestResult, open_fs_path},
     };

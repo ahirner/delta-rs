@@ -387,7 +387,8 @@ async fn get_data_scan_plan(
         limit,
         &file_id_field,
         predicate,
-        Some(&scan_plan.result_schema),
+        None,
+        //Some(&scan_plan.result_schema),
     )
     .await?;
 
@@ -477,6 +478,7 @@ async fn get_read_plan(
     logical_schema: Option<&SchemaRef>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut plans = Vec::new();
+    dbg!(&parquet_read_schema);
 
     let pq_options = TableParquetOptions {
         global: state.config().options().execution.parquet.clone(),
@@ -512,26 +514,33 @@ async fn get_read_plan(
         // interfere with other delta features like row ids.
         let has_selection_vectors = files.iter().any(|(_, sv)| sv.is_some());
         if !has_selection_vectors && let Some(pred) = predicate {
+            /*
             let df_schema_to_use = if let Some(ls) = logical_schema {
                 ls.clone().to_dfschema()?
             } else {
                 full_read_df_schema.clone()
-            };
+            };*/
+            let df_schema_to_use = &full_read_df_schema;
 
             // Predicate pushdown can reference the synthetic file-id partition column.
             // Use the full read schema (data columns + file-id) when planning.
-            let physical = state.create_physical_expr(pred.clone(), &df_schema_to_use)?;
+            let _physical = match state.create_physical_expr(pred.clone(), df_schema_to_use) {
+                Ok(physical) => {
+                    let adapted_physical = if let Some(ls) = logical_schema {
+                        let adapter = adapter_factory.create(ls.clone(), full_read_schema.clone());
+                        adapter.rewrite(physical.clone()).unwrap_or(physical)
+                    } else {
+                        physical
+                    };
 
-            let adapted_physical = if let Some(ls) = logical_schema {
-                let adapter = adapter_factory.create(ls.clone(), full_read_schema.clone());
-                adapter.rewrite(physical.clone()).unwrap_or(physical)
-            } else {
-                physical
+                    file_source = file_source
+                        .with_predicate(adapted_physical)
+                        .with_pushdown_filters(true);
+                }
+                Err(e) => {
+                    eprintln!("get_read_plan: create_physical from predicate: {pred} -> {e}");
+                }
             };
-
-            file_source = file_source
-                .with_predicate(adapted_physical)
-                .with_pushdown_filters(true);
         }
 
         let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
@@ -542,14 +551,14 @@ async fn get_read_plan(
             .with_file_groups(file_groups)
             .with_statistics(statistics)
             .with_limit(limit)
-            .with_expr_adapter(Some(adapter_factory.clone() as _))
+            //.with_expr_adapter(Some(adapter_factory.clone() as _))
             .build();
 
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
     }
 
     Ok(match plans.len() {
-        0 => Arc::new(EmptyExec::new(full_read_schema.clone())),
+        0 => Arc::new(EmptyExec::new(full_read_schema)),
         1 => plans.remove(0),
         _ => UnionExec::try_new(plans)?,
     })

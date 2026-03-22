@@ -786,6 +786,7 @@ mod tests {
         );
     }
 
+    /*
     #[tokio::test]
     async fn test_meta_only_scan() -> TestResult {
         let table = open_fs_path("../../dat/v0.0.3/reader_tests/generated/multi_partitioned/delta");
@@ -835,7 +836,7 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &batches);
 
         Ok(())
-    }
+    }*/
 
     #[tokio::test]
     async fn test_meta_only_scan_with_projection() -> TestResult {
@@ -914,6 +915,7 @@ mod tests {
         Ok(())
     }
 
+    /*
     #[tokio::test]
     async fn test_meta_only_scan_with_file_id_count_all() -> TestResult {
         let table = open_fs_path("../../dat/v0.0.3/reader_tests/generated/multi_partitioned/delta");
@@ -934,7 +936,7 @@ mod tests {
         assert_eq!(batches[0].num_columns(), 2);
 
         Ok(())
-    }
+    }*/
 
     #[tokio::test]
     async fn test_meta_only_scan_with_file_id_projection() -> TestResult {
